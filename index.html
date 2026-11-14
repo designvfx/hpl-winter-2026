@@ -16,6 +16,7 @@ function unavailable(){msg('Demo preview • database not connected');$('config-
 async function load(){if(!db){unavailable();return}try{let [t,p,m,s]=await Promise.all([db.from('teams').select('*').order('id'),db.from('players').select('*').order('name'),db.from('matches').select('*').order('match_no'),db.from('player_match_stats').select('*')]);for(let r of [t,p,m,s])if(r.error)throw r.error;teams=t.data;players=p.data;matches=m.data;scores=s.data;await syncPlayoffs();msg('● Live database connected');$('connection').style.color='#14845d';$('config-note').classList.add('hidden');render()}catch(e){msg('Database connection issue');$('view').innerHTML=`<div class="notice">${esc(e.message)}<br>Check config.js and confirm schema.sql has been run.</div>`}}
 function points(){return teams.map(t=>{let played=matches.filter(m=>m.stage==='League'&&m.status==='completed'&&(m.team_a_id===t.id||m.team_b_id===t.id));let won=played.filter(m=>m.winner_team_id===t.id).length;return {...t,played:played.length,won,lost:played.length-won,points:won*2}}).sort((a,b)=>b.points-a.points||b.won-a.won)}
 
+
 async function syncPlayoffs() {
   if (!db) return;
 
@@ -23,48 +24,97 @@ async function syncPlayoffs() {
     m => m.stage === 'League'
   );
 
-  // Do not assign playoff teams until all 6 league matches finish.
-  if (leagueMatches.length !== 6 ||
-      !leagueMatches.every(m => m.status === 'completed')) {
-    return;
-  }
-
-  const standings = points();
-  const semi = matches.find(m => m.match_no === 7);
-  const final = matches.find(m => m.match_no === 8);
+  const semi = matches.find(m => Number(m.match_no) === 7);
+  const final = matches.find(m => Number(m.match_no) === 8);
 
   if (!semi || !final) return;
 
-  // Semi-final: 2nd vs 3rd
-  const semiA = standings[1]?.id ?? null;
-  const semiB = standings[2]?.id ?? null;
+  const leagueComplete =
+    leagueMatches.length === 6 &&
+    leagueMatches.every(m => m.status === 'completed');
 
-  if (semi.status !== 'completed') {
-    await db.from('matches').update({
-      team_a_id: semiA,
-      team_b_id: semiB
-    }).eq('id', semi.id);
+  // RESET PLAYOFFS if all 6 league matches are not completed.
+  if (!leagueComplete) {
+    for (const playoff of [semi, final]) {
+      const needsReset =
+        playoff.team_a_id !== null ||
+        playoff.team_b_id !== null ||
+        playoff.winner_team_id !== null ||
+        playoff.status !== 'upcoming';
 
-    semi.team_a_id = semiA;
-    semi.team_b_id = semiB;
+      if (needsReset) {
+        const { error } = await db
+          .from('matches')
+          .update({
+            team_a_id: null,
+            team_b_id: null,
+            winner_team_id: null,
+            team_a_score: null,
+            team_b_score: null,
+            overs: null,
+            status: 'upcoming'
+          })
+          .eq('id', playoff.id);
+
+        if (error) throw error;
+
+        Object.assign(playoff, {
+          team_a_id: null,
+          team_b_id: null,
+          winner_team_id: null,
+          team_a_score: null,
+          team_b_score: null,
+          overs: null,
+          status: 'upcoming'
+        });
+      }
+    }
+
+    return;
   }
 
-  // Grand Final: 1st vs Semi-final winner
-  const finalA = standings[0]?.id ?? null;
-  const finalB = semi.status === 'completed'
-    ? semi.winner_team_id
-    : null;
+  // Calculate final league standings.
+  const standings = points();
 
+  if (standings.length < 3) return;
+
+  // SEMI-FINAL: 2nd vs 3rd.
+  if (semi.status !== 'completed') {
+    const { error } = await db
+      .from('matches')
+      .update({
+        team_a_id: standings[1].id,
+        team_b_id: standings[2].id
+      })
+      .eq('id', semi.id);
+
+    if (error) throw error;
+
+    semi.team_a_id = standings[1].id;
+    semi.team_b_id = standings[2].id;
+  }
+
+  // GRAND FINAL: 1st vs Semi-final winner.
   if (final.status !== 'completed') {
-    await db.from('matches').update({
-      team_a_id: finalA,
-      team_b_id: finalB
-    }).eq('id', final.id);
+    const { error } = await db
+      .from('matches')
+      .update({
+        team_a_id: standings[0].id,
+        team_b_id: semi.status === 'completed'
+          ? semi.winner_team_id
+          : null
+      })
+      .eq('id', final.id);
 
-    final.team_a_id = finalA;
-    final.team_b_id = finalB;
+    if (error) throw error;
+
+    final.team_a_id = standings[0].id;
+    final.team_b_id = semi.status === 'completed'
+      ? semi.winner_team_id
+      : null;
   }
 }
+
 
 function batting(){let map={};scores.forEach(s=>{let p=players.find(x=>x.id===s.player_id);if(!p)return;let x=map[p.id]||{player:p,runs:0,balls:0,fours:0,sixes:0,outs:0,innings:0};x.runs+=s.runs||0;x.balls+=s.balls_faced||0;x.fours+=s.fours||0;x.sixes+=s.sixes||0;x.outs+=s.dismissed?1:0;x.innings++;map[p.id]=x});return Object.values(map).sort((a,b)=>b.runs-a.runs)}
 function bowling(){let map={};scores.forEach(s=>{let p=players.find(x=>x.id===s.player_id);if(!p)return;let x=map[p.id]||{player:p,wickets:0,runs:0,balls:0,maidens:0};x.wickets+=s.wickets||0;x.runs+=s.runs_conceded||0;x.balls+=s.bowling_balls||0;x.maidens+=s.maidens||0;map[p.id]=x});return Object.values(map).sort((a,b)=>b.wickets-a.wickets||a.runs-b.runs)}
